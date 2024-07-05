@@ -42,7 +42,7 @@ Before we can do anything you need to install the plugin within your keystone en
 the example here is using `pip`.
 
 ``` shell
-pip install --force --upgrade git+https://github.com/cloudnull/keystone-rxt
+pip install --force --upgrade git+https://github.com/rackerlabs/keystone-rxt
 ```
 
 > This plugin is not yet on PyPi, but that will change with time.
@@ -58,6 +58,7 @@ The configuration file entry will look something like this
 methods = password,token,application_credential
 password = rxt
 ```
+
 > Take note that the `password` method is defined and that the password plugin is set to use `rxt`.
 
 If you have multifactor auth enabled, and want to support users that are running work loads with it
