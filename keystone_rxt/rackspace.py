@@ -69,7 +69,7 @@ ROLE_ATTRIBUTE_ENFORCEMENT = keystone.conf.cfg.BoolOpt(
 If disabled and no role is found, the plugin will fall back to using the DDI.
 """,
     ),
-    default=True,
+    default=False,
 )
 
 keystone.conf.CONF.register_opts(
@@ -101,7 +101,6 @@ class RXTv2Credentials(object):
         """
 
         self.auth_payload = auth_payload
-        LOG.debug(_("Rackspace IDP auth payload: {payload}").format(payload=auth_payload))
         self.hashed_auth_payload = hashlib.sha224(
             json.dumps(self.auth_payload, sort_keys=True).encode("utf-8")
         ).hexdigest()
@@ -109,6 +108,7 @@ class RXTv2Credentials(object):
             self._username.encode("utf-8")
         ).hexdigest()
         self.session_id = self._sessionID
+        self.access_projects = list()
 
     def __exit__(self, *args, **kwargs):
         """Close the session.
@@ -162,26 +162,6 @@ class RXTv2Credentials(object):
                 raise exception.Unauthorized(
                     _("The authentication payload is missing the name")
                 )
-
-    @property
-    def _project(self):
-        """Return a parsed project property.
-
-        This property is used to return the project from the auth payload.
-
-        If no project is found in the auth payload the property will return `None`.
-
-        :returns: The project from the auth payload.
-        :rtype: str
-        """
-
-        try:
-            return self.auth_payload["user"]["project_name"]
-        except KeyError:
-            try:
-                return self.auth_payload["user"]["project_id"]
-            except KeyError:
-                return
 
     @staticmethod
     def _return_session_id(session_header):
@@ -267,36 +247,46 @@ class RXTv2Credentials(object):
         the method will deny access.
         """
 
-        role_attribute = keystone.conf.rackspace.role_attribute
+        role_attribute = keystone.conf.CONF.rackspace.role_attribute
 
         try:
             access = service_catalog["access"]
             access_user = access["user"]
             access_token = access["token"]
-            access_user_roles = set(
-                [
-                    i["name"].split(":")[-1]
-                    for i in service_catalog["access"]["user"]["roles"]
-                    if access_token["tenant"]["id"] in i.get("tenantId", "")
-                ]
-            )
+            access_user_roles = set()
 
-            if role_attribute != "":
-                access_projects = [
-                    i["tenantId"].split(":")[-1]
-                    for i in service_catalog["access"]["user"]["roles"]
-                    if i.get("tenantId", "").startswith(role_attribute)
-                ]
-            else:
-                access_projects = list()
+            for role in service_catalog["access"]["user"]["roles"]:
+                rxt_tenantId = role.get("tenantId")
+                try:
+                    if access_token["tenant"]["id"] in rxt_tenantId:
+                        access_user_roles.add(role["name"].split(":")[-1])
+                    role, value = rxt_tenantId.split(":")
+                except (ValueError, TypeError):
+                    continue
+                else:
+                    if role.startswith(role_attribute):
+                        self.access_projects.append(value)
 
-            if not keystone.conf.rackspace.role_attribute_enforcement:
-                access_projects.append(access_token["tenant"]["id"])
+            self.access_projects = sorted(self.access_projects)
+            if not keystone.conf.CONF.rackspace.role_attribute_enforcement:
+                self.access_projects.append(
+                    "{tenant}_Flex".format(tenant=access_token["tenant"]["id"])
+                )
 
             try:
-                index = access_projects.index(self._project)
-            except ValueError:
-                if not access_projects:
+                # FIXME(cloudnull): This is a hack to pull the tenant_id
+                #                   from the list of access_projects. This is
+                #                   a temporary fix until we can get the
+                #                   correct tenant_id from the list of
+                #                   access_projects or create the ability to
+                #                   select load all projects for the user using
+                #                   the role_attribute with an unscoped token.
+                #
+                # index = self.access_projects.index(self._project)
+                # tenant_id = self.access_projects.pop(index)
+                tenant_id = self.access_projects[0]
+            except (ValueError, IndexError):
+                if not self.access_projects:
                     raise exception.Unauthorized(
                         _(
                             "User does not have the required role"
@@ -306,22 +296,19 @@ class RXTv2Credentials(object):
                 else:
                     raise keystone.exception.ProjectNotFound(
                         _(
-                            "The Project {project} was not found. The"
+                            "The Project was not found. The"
                             " following choices are available:"
                             " {project_list}.".format(
-                                project=self._project,
-                                project_list=access_projects,
+                                project_list=self.access_projects,
                             )
                         )
                     )
-            else:
-                tenant_id = access_projects.pop(index)
 
             self._set_federation_env(
                 username=access_user["name"],
                 email=access_user["email"],
                 domain_id=access_user["RAX-AUTH:domainId"],
-                tenant_name=access_token["tenant"]["name"],
+                tenant_name=tenant_id,
                 tenant_id=tenant_id,
                 org_person_type=";".join(access_user_roles),
             )
@@ -383,6 +370,7 @@ class RXTv2Credentials(object):
         :returns: True if the Rackspace Identity API returns a boolean.
         :rtype: bool
         """
+
         service_catalog = RXT_SERVICE_CACHE.get(self.hashed_auth_payload)
         if service_catalog:
             try:
