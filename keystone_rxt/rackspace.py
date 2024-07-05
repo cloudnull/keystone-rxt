@@ -17,6 +17,8 @@ import re
 import hashlib
 import json
 
+import keystone.conf.utils
+import keystone.exception
 import requests
 from oslo_log import log
 import flask
@@ -44,6 +46,35 @@ RXT_SERVICE_CACHE.expiration_time = 60
 LOG = log.getLogger(__name__)
 PROVIDERS = mapped.PROVIDERS
 RACKPSACE_IDENTITY_V2 = "https://identity.api.rackspacecloud.com/v2.0/tokens"
+ROLE_ATTRIBUTE = keystone.conf.cfg.StrOpt(
+    "role_attribute",
+    help=keystone.conf.utils.fmt(
+        """The attribute to use for the role granting account access.
+
+This attribute can be any role within the Rackspace Identity API.
+The system will process the attribute as a prefix sourcing the `tenantId`
+from the `user` `roles` found within Rackspace Identity API catalog.
+
+If an empty string is used, the system will disable this mechanism and
+fall back to using the DDI.
+"""
+    ),
+    default="os_flex",
+)
+ROLE_ATTRIBUTE_ENFORCEMENT = keystone.conf.cfg.BoolOpt(
+    "role_attribute_enforcement",
+    help=keystone.conf.utils.fmt(
+        """Enables or disables the enforcement of role attributes.
+
+If disabled and no role is found, the plugin will fall back to using the DDI.
+""",
+    ),
+    default=False,
+)
+
+keystone.conf.CONF.register_opts(
+    [ROLE_ATTRIBUTE, ROLE_ATTRIBUTE_ENFORCEMENT], group="rackspace"
+)
 
 
 class RXTv2Credentials(object):
@@ -131,6 +162,26 @@ class RXTv2Credentials(object):
                     _("The authentication payload is missing the name")
                 )
 
+    @property
+    def _project(self):
+        """Return a parsed project property.
+
+        This property is used to return the project from the auth payload.
+
+        If no project is found in the auth payload the property will return `None`.
+
+        :returns: The project from the auth payload.
+        :rtype: str
+        """
+
+        try:
+            return self.auth_payload["user"]["project_name"]
+        except KeyError:
+            try:
+                return self.auth_payload["user"]["project_id"]
+            except KeyError:
+                return
+
     @staticmethod
     def _return_session_id(session_header):
         """Return the sessionID from the session header.
@@ -215,30 +266,73 @@ class RXTv2Credentials(object):
         the method will deny access.
         """
 
+        role_attribute = keystone.conf.CONF.rackspace.role_attribute
+
         try:
             access = service_catalog["access"]
             access_user = access["user"]
             access_token = access["token"]
-            access_user_roles = set(
-                [
-                    i["name"].split(":")[-1]
-                    for i in service_catalog["access"]["user"]["roles"]
-                    if access_token["tenant"]["id"] in i.get("tenantId", "")
-                ]
-            )
+            access_user_roles = set()
+            access_projects = list()
+
+            for role in service_catalog["access"]["user"]["roles"]:
+                rxt_tenantId = role.get("tenantId")
+                try:
+                    if access_token["tenant"]["id"] in rxt_tenantId:
+                        access_user_roles.add(role["name"].split(":")[-1])
+                    role, value = rxt_tenantId.split(":")
+                except (ValueError, TypeError):
+                    continue
+                else:
+                    if role.startswith(role_attribute):
+                        access_projects.append(value)
+
+            access_projects = sorted(access_projects)
+            if not keystone.conf.CONF.rackspace.role_attribute_enforcement:
+                access_projects.append(access_token["tenant"]["id"])
+
+            try:
+                # FIXME(cloudnull): This is a hack to remove the tenant_id
+                #                   from the list of access_projects. This is
+                #                   a temporary fix until we can get the
+                #                   correct tenant_id from the list of
+                #                   access_projects.
+                # index = access_projects.index(self._project)
+                # tenant_id = access_projects.pop(index)
+                tenant_id = access_projects.pop(0)
+            except (ValueError, IndexError):
+                if not access_projects:
+                    raise exception.Unauthorized(
+                        _(
+                            "User does not have the required role"
+                            " attribute to continue."
+                        )
+                    )
+                else:
+                    raise keystone.exception.ProjectNotFound(
+                        _(
+                            "The Project {project} was not found. The"
+                            " following choices are available:"
+                            " {project_list}.".format(
+                                project=self._project,
+                                project_list=access_projects,
+                            )
+                        )
+                    )
+
             self._set_federation_env(
                 username=access_user["name"],
                 email=access_user["email"],
                 domain_id=access_user["RAX-AUTH:domainId"],
                 tenant_name=access_token["tenant"]["name"],
-                tenant_id=access_token["tenant"]["id"],
+                tenant_id=tenant_id,
                 org_person_type=";".join(access_user_roles),
             )
         except KeyError as e:
             raise exception.Unauthorized(
                 _(
-                    "Could not parse the Rackspace Service Catalog for access:"
-                    " {error}".format(error=e)
+                    "Could not parse the Rackspace Service Catalog for"
+                    " access: {error}".format(error=e)
                 )
             )
 
@@ -259,7 +353,9 @@ class RXTv2Credentials(object):
                     self.auth_payload["id"]
                 )
                 response_data = mapped.handle_scoped_token(
-                    token_ref, PROVIDERS.federation_api, PROVIDERS.identity_api
+                    token_ref,
+                    PROVIDERS.federation_api,
+                    PROVIDERS.identity_api,
                 )
             else:
                 response_data = mapped.handle_unscoped_token(
