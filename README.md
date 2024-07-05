@@ -58,6 +58,7 @@ The configuration file entry will look something like this
 methods = password,token,application_credential
 password = rxt
 ```
+
 > Take note that the `password` method is defined and that the password plugin is set to use `rxt`.
 
 If you have multifactor auth enabled, and want to support users that are running work loads with it

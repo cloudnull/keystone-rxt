@@ -17,6 +17,8 @@ import re
 import hashlib
 import json
 
+import keystone.conf.utils
+import keystone.exception
 import requests
 from oslo_log import log
 import flask
@@ -44,6 +46,35 @@ RXT_SERVICE_CACHE.expiration_time = 60
 LOG = log.getLogger(__name__)
 PROVIDERS = mapped.PROVIDERS
 RACKPSACE_IDENTITY_V2 = "https://identity.api.rackspacecloud.com/v2.0/tokens"
+ROLE_ATTRIBUTE = keystone.conf.cfg.StrOpt(
+    "role_attribute",
+    help=keystone.conf.utils.fmt(
+        """The attribute to use for the role granting account access.
+
+This attribute can be any role within the Rackspace Identity API.
+The system will process the attribute as a prefix sourcing the `tenantId`
+from the `user` `roles` found within Rackspace Identity API catalog.
+
+If an empty string is used, the system will disable this mechanism and
+fall back to using the DDI.
+"""
+    ),
+    default="os_flex",
+)
+ROLE_ATTRIBUTE_ENFORCEMENT = keystone.conf.cfg.BoolOpt(
+    "role_attribute_enforcement",
+    help=keystone.conf.utils.fmt(
+        """Enables or disables the enforcement of role attributes.
+
+If disabled and no role is found, the plugin will fall back to using the DDI.
+""",
+    ),
+    default=True,
+)
+
+keystone.conf.CONF.register_opts(
+    [ROLE_ATTRIBUTE, ROLE_ATTRIBUTE_ENFORCEMENT], group="rackspace"
+)
 
 
 class RXTv2Credentials(object):
@@ -70,6 +101,7 @@ class RXTv2Credentials(object):
         """
 
         self.auth_payload = auth_payload
+        LOG.debug(_("Rackspace IDP auth payload: {payload}").format(payload=auth_payload))
         self.hashed_auth_payload = hashlib.sha224(
             json.dumps(self.auth_payload, sort_keys=True).encode("utf-8")
         ).hexdigest()
@@ -130,6 +162,26 @@ class RXTv2Credentials(object):
                 raise exception.Unauthorized(
                     _("The authentication payload is missing the name")
                 )
+
+    @property
+    def _project(self):
+        """Return a parsed project property.
+
+        This property is used to return the project from the auth payload.
+
+        If no project is found in the auth payload the property will return `None`.
+
+        :returns: The project from the auth payload.
+        :rtype: str
+        """
+
+        try:
+            return self.auth_payload["user"]["project_name"]
+        except KeyError:
+            try:
+                return self.auth_payload["user"]["project_id"]
+            except KeyError:
+                return
 
     @staticmethod
     def _return_session_id(session_header):
@@ -215,6 +267,8 @@ class RXTv2Credentials(object):
         the method will deny access.
         """
 
+        role_attribute = keystone.conf.rackspace.role_attribute
+
         try:
             access = service_catalog["access"]
             access_user = access["user"]
@@ -226,19 +280,56 @@ class RXTv2Credentials(object):
                     if access_token["tenant"]["id"] in i.get("tenantId", "")
                 ]
             )
+
+            if role_attribute != "":
+                access_projects = [
+                    i["tenantId"].split(":")[-1]
+                    for i in service_catalog["access"]["user"]["roles"]
+                    if i.get("tenantId", "").startswith(role_attribute)
+                ]
+            else:
+                access_projects = list()
+
+            if not keystone.conf.rackspace.role_attribute_enforcement:
+                access_projects.append(access_token["tenant"]["id"])
+
+            try:
+                index = access_projects.index(self._project)
+            except ValueError:
+                if not access_projects:
+                    raise exception.Unauthorized(
+                        _(
+                            "User does not have the required role"
+                            " attribute to continue."
+                        )
+                    )
+                else:
+                    raise keystone.exception.ProjectNotFound(
+                        _(
+                            "The Project {project} was not found. The"
+                            " following choices are available:"
+                            " {project_list}.".format(
+                                project=self._project,
+                                project_list=access_projects,
+                            )
+                        )
+                    )
+            else:
+                tenant_id = access_projects.pop(index)
+
             self._set_federation_env(
                 username=access_user["name"],
                 email=access_user["email"],
                 domain_id=access_user["RAX-AUTH:domainId"],
                 tenant_name=access_token["tenant"]["name"],
-                tenant_id=access_token["tenant"]["id"],
+                tenant_id=tenant_id,
                 org_person_type=";".join(access_user_roles),
             )
         except KeyError as e:
             raise exception.Unauthorized(
                 _(
-                    "Could not parse the Rackspace Service Catalog for access:"
-                    " {error}".format(error=e)
+                    "Could not parse the Rackspace Service Catalog for"
+                    " access: {error}".format(error=e)
                 )
             )
 
@@ -259,7 +350,9 @@ class RXTv2Credentials(object):
                     self.auth_payload["id"]
                 )
                 response_data = mapped.handle_scoped_token(
-                    token_ref, PROVIDERS.federation_api, PROVIDERS.identity_api
+                    token_ref,
+                    PROVIDERS.federation_api,
+                    PROVIDERS.identity_api,
                 )
             else:
                 response_data = mapped.handle_unscoped_token(
