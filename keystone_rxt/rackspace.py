@@ -846,7 +846,7 @@ class RXTPassword(password.Password):
                     auth_payload["user"]["domain"]["name"]
                     == RACKSPACE_AUTH_DOMAIN
                 )
-        except (KeyError, AssertionError):
+        except (KeyError, AssertionError, ValueError):
             LOG.debug(_("Using OS Password Authentication"))
             return super(RXTPassword, self).authenticate(auth_payload)
         else:
