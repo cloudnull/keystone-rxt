@@ -70,9 +70,28 @@ If disabled and no role is found, the plugin will fall back to using the DDI.
     ),
     default=False,
 )
-
 keystone.conf.CONF.register_opts(
     [ROLE_ATTRIBUTE, ROLE_ATTRIBUTE_ENFORCEMENT], group="rackspace"
+)
+RACKSPACE_AUTH_DOMAIN = keystone.conf.cfg.StrOpt(
+    "rackspace_auth_domain",
+    help=keystone.conf.utils.fmt(
+        "A limited domain where users will be assumed to be federated."
+    ),
+    default="rackspace_cloud_domain",
+)
+RACKSPACE_AUTH_DDI = keystone.conf.cfg.BoolOpt(
+    "rackspace_ddi_domains",
+    help=keystone.conf.utils.fmt(
+        """Enables or disables DDI based federation.
+
+When enabled, the domain will be assumed to be a DDI. This mode will run
+a check to see if the domain name value is an integer, as would be
+expected by Rackspace Global Auth. When disabled, the system will run
+validations against the defined `rackspace_auth_domain` value.
+""",
+    ),
+    default=False,
 )
 
 
@@ -105,7 +124,7 @@ class RuleProcessor(mapped.utils.RuleProcessor):
             {
                 'RXT_UserName': 'testacct',
                 'RXT_Email': 'testacct@example.com',
-                'RXT_DomainID': 'rackspace_cloud_domain',
+                'RXT_DomainID': 'RACKSPACE_AUTH_DOMAIN',
                 'RXT_TenantName': '00000000-0000-0000-0000-000000000000;0000000_Flex',
                 'RXT_TenantID': '00000000-0000-0000-0000-000000000000;0000000_Flex',
                 'RXT_orgPersonType': 'default;tenant-access'
@@ -119,7 +138,7 @@ class RuleProcessor(mapped.utils.RuleProcessor):
                     "name": "testacct",
                     "email": "testacct@example.com",
                     "domain": {
-                        "name": "rackspace_cloud_domain"
+                        "name": "RACKSPACE_AUTH_DOMAIN"
                     },
                     "type": "ephemeral",
                 },
@@ -128,7 +147,7 @@ class RuleProcessor(mapped.utils.RuleProcessor):
                 "projects": [
                     {
                         "name": "00000000-0000-0000-0000-000000000000",
-                        "domain": {"name": "rackspace_cloud_domain"},
+                        "domain": {"name": "RACKSPACE_AUTH_DOMAIN"},
                         "roles": [
                             {"name": "member"},
                             {"name": "load-balancer_member"},
@@ -138,7 +157,7 @@ class RuleProcessor(mapped.utils.RuleProcessor):
                     {
                         "name": "0000000_Flex",
                         "domain": {
-                            "name": "rackspace_cloud_domain"
+                            "name": "RACKSPACE_AUTH_DOMAIN"
                         },
                         "roles": [
                             {"name": "member"},
@@ -820,10 +839,13 @@ class RXTPassword(password.Password):
         """Return a signed request with an access key into a keystone token."""
 
         try:
-            assert (
-                auth_payload["user"]["domain"]["name"]
-                == "rackspace_cloud_domain"
-            )
+            if RACKSPACE_AUTH_DDI:
+                int(auth_payload["user"]["domain"]["name"])  # Check that the domain is an integer
+            else:
+                assert (
+                    auth_payload["user"]["domain"]["name"]
+                    == RACKSPACE_AUTH_DOMAIN
+                )
         except (KeyError, AssertionError):
             LOG.debug(_("Using OS Password Authentication"))
             return super(RXTPassword, self).authenticate(auth_payload)
@@ -845,11 +867,14 @@ class RXTTOTP(totp.TOTP):
         """Return a signed request with an access key into a keystone token."""
 
         try:
-            assert (
-                auth_payload["user"]["domain"]["name"]
-                == "rackspace_cloud_domain"
-            )
-        except (KeyError, AssertionError):
+            if RACKSPACE_AUTH_DDI:
+                int(auth_payload["user"]["domain"]["name"])  # Check that the domain is an integer
+            else:
+                assert (
+                    auth_payload["user"]["domain"]["name"]
+                    == RACKSPACE_AUTH_DOMAIN
+                )
+        except (KeyError, AssertionError, ValueError):
             LOG.debug(_("Using OS TOTP Authentication"))
             return super(RXTTOTP, self).authenticate(auth_payload)
         else:
